@@ -1,0 +1,84 @@
+1. Создаем и запускаем пару серверов: postgres-master на порту 5551 и postgres-slave на порту 5552
+
+> docker run --name postgres-master -p 5551:5432 -v C:\Temp\PGDATA_MASTER:/var/lib/postgresql/data -v C:\Temp\HOME_MASTER:/home -e POSTGRES_PASSWORD=12345678 -e POSTGRES_DB=sample -d postgres
+
+> docker run --name postgres-slave -p 5552:5432 -v C:\Temp\PGDATA_SLAVE:/var/lib/postgresql/data -v C:\Temp\PGDATA_SLAVE_BACKUP:/var/lib/postgresql/backup -v C:\Temp\HOME_SLAVE:/home -e POSTGRES_PASSWORD=12345678 -e POSTGRES_DB=sample -d postgres
+
+Результат на снимке "Containers.png".
+
+2. Выясняем сетевые параметры
+
+> docker inspect postgres-master
+"IPAddress": "172.17.0.2",
+...
+> docker inspect postgres-slave
+"IPAddress": "172.17.0.3",
+...
+
+3. Подключаемся к postgres-master и настроим его
+
+> docker exec -it postgres-master bash 
+# cat /etc/localtime
+UTC0
+# echo "wal_log_hints = on" >> /var/lib/postgresql/data/postgresql.conf
+# echo "archive_mode = on" >> /var/lib/postgresql/data/postgresql.conf
+# echo "archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'" >> /var/lib/postgresql/data/postgresql.conf
+# echo "archive_cleanup_command = 'pg_archivecleanup /archive %r'" >> /var/lib/postgresql/data/postgresql.conf
+# echo "restore_command = 'cp /archive/%f %p'" >> /var/lib/postgresql/data/postgresql.conf
+# echo "full_page_writes = on" >> /var/lib/postgresql/data/postgresql.conf
+# echo "host	replication	replica		0.0.0.0/0		md5" >> /var/lib/postgresql/data/pg_hba.conf
+# echo "host	all		rewind		0.0.0.0/0		md5" >> /var/lib/postgresql/data/pg_hba.conf
+# mkdir /archive
+# chown -R postgres:postgres /archive
+# su postgres
+$ psql -c "CREATE USER replica with replication encrypted password 'test123'"
+CREATE ROLE
+$ psql -c "CREATE USER rewind SUPERUSER encrypted PASSWORD 'test123'"
+CREATE ROLE
+$ exit
+# exit
+
+4. Перезапускаем контейнер postgres-master
+
+5. Подключаемся к postgres-slave и настраиваем репликацию
+
+>docker exec -it postgres-slave bash
+# su postgres
+$ pg_basebackup --host=172.17.0.2 --port=5432 --username=replica --pgdata=/var/lib/postgresql/backup/ --progress --write-recovery-conf --create-slot --slot=replica
+
+6. Репликация выполнена в каталог /var/lib/postgresql/backup, но сервер работает с каталогом /var/lib/postgresql/data. В обычной системе можно было бы просто остановить postgres, удалить содержимое data и перенести в нее содержимое backup. Но контейнер этого сделать не даст. После удаления рабочего каталога pastgres аварийно завершается, а вместе с ним завершается и контейнер. 
+Поскольку /var/lib/postgresql/data отображается в C:\Temp\PGDATA_SLAVE, а /var/lib/postgresql/backup в C:\Temp\PGDATA_SLAVE_BACKUP, поэтому просто остановим postgres-slave и перенесем backup в data прямо в родительской системе. 
+После запуска postgres-slave имеем 2 сервера postgres, где второй является зеркалом первого и все изменения в первом, автоматически отражается во втором.
+
+Результат на снимке "Replication in action.png"
+
+7. Если мастер вышел из строя, делаем следующее. Поднимаем postgres-slave до основного 
+
+>docker exec -it postgres-slave bash
+# su postgres
+$ pg_ctl promote
+waiting for server to promote.... done
+server promoted
+
+После поднятия можем править данные на postgres-slave.
+
+Результат на снимках "Promote.png" и "Edit slave.png".
+
+8. Для перемотки мастера до актуального состояния требуется выполнить следующее
+
+> docker exec -it postgres-master bash
+# pg_ctl stop
+# su postgres
+$ pg_rewind --target-pgdata /var/lib/postgresql/data --source-server="postgresql://rewind:test123@172.17.0.3:5432/sample" --progress
+
+К сожалению, чтобы это сработало, делать это надо на нормальной системе, а не в контейнере. Контейнер не даст остановить постгрес. 
+Поэтому тут скриншотов не будет
+
+9. И, наконец, вернем postgres-slave в подчиненный режим
+
+$ touch /var/lib/postgresql/data/standby.signal
+
+
+
+
+
